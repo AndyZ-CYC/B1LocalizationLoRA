@@ -13,8 +13,9 @@ train_lora.py – LoRA fine‑tune Qwen‑32B‑Chat on Alpaca‑format jsonl
    • gradient_checkpointing=True 降显存
    • 默认 rank 64 / alpha 128 / rsLoRA 可开关
 """
-
-import argparse, json, logging, os, sys, math, torch
+import os
+os.environ["TRANSFORMERS_NO_TP"] = "1"
+import argparse, json, logging, sys, math, torch
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
@@ -30,8 +31,11 @@ from trl import SFTTrainer
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # data & model
+    p.add_argument("--model_dir", type=str, default="/opt/ml/input/model",
+                   help="本地 Qwen‑32B 权重目录; 若不存在则尝试 HF Hub")
     p.add_argument("--base_model", type=str,
-                   default="Qwen/Qwen-32B-Chat", help="HF hub id or path")
+                   default="Qwen/Qwen-32B-Chat",
+                   help="HF Hub id; 离线时忽略")
     p.add_argument("--train_file", type=str, required=True)
     p.add_argument("--dev_file",   type=str, required=True)
     p.add_argument("--output_dir", type=str,
@@ -105,21 +109,37 @@ def main() -> None:
     )
     logging.info("Effective args:\n%s", json.dumps(vars(args), indent=2))
 
-    # tokenizer
-    tok = AutoTokenizer.from_pretrained(
-        args.base_model, trust_remote_code=True)
-    tok.pad_token = tok.eos_token
+    # 1) select path
+    model_src = args.model_dir if os.path.exists(os.path.join(args.model_dir, "config.json")) else args.base_model
+    logging.info("Loading model from: %s", model_src)
 
-    # base model – BF16 + auto sharding
+    # 2) tokenizer
+    try:
+        # 先尝试 fast（若未来镜像升级，可自动生效）
+        tok = AutoTokenizer.from_pretrained(
+            model_src,
+            trust_remote_code=True,
+            local_files_only=True
+        )
+    except Exception as e:
+        logging.warning("Fast tokenizer failed (%s). Fallback to slow tokenizer.", e)
+        tok = AutoTokenizer.from_pretrained(
+            model_src,
+            trust_remote_code=True,
+            local_files_only=True,
+            use_fast=False        # ← 强制 slow 版本
+        )
+
+    # 3) base model – BF16 + auto sharding
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        model_src,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
     logging.info("Base model loaded")
 
-    # LoRA config
+    # 4) LoRA config
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
