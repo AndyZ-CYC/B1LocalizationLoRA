@@ -27,11 +27,14 @@
 | 其它 LoRA 超参 | `lora_r=64 lora_alpha=128 lora_dropout=0.05` | 可在 `start.sh` 末行修改 |
 
 ### 4. 产物  
-训练结束后，适配器目录会写入
-output/{任务id}/model/${STYLE}/
+训练结束后，适配器目录会写入  
+`output/{任务id}/model/${STYLE}/`
+
+```
 ├── adapter_config.json
 ├── adapter_model.bin
-└── tokenizer_* # 同步保存 tokenizer
+└── tokenizer_*  # 同步保存 tokenizer
+```
 
 日志在 `output/{任务id}/model/${STYLE}/train.log`；验证集指标将自动打印在控制台。
 
@@ -75,5 +78,6 @@ JSONL 文件中每行格式：
   "reference": "...",
   "prediction": "..."
 }
+```
 
 便于后续人工比对或进一步评测（COMET、人工打分等）。
