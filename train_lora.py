@@ -1,199 +1,184 @@
 #!/usr/bin/env python
 """
-train_lora.py – LoRA fine‑tune Qwen‑32B‑Chat on Alpaca‑format jsonl
+LoRA 微调脚本 – 适配 TI‑ONE & Accelerate (torch‑2.7.0)
 
-✓ 兼容 TI‑ONE 两种传参方式：
-   • 启动命令中显式 --arg value
-   • 「调优参数」JSON → /opt/ml/input/config/hyperparameters.json
-   （同名字段被 JSON 覆盖；命令行优先）
-
-✓ 针对 32B + 8 × H20：
-   • torch_dtype = bfloat16
-   • device_map="auto"  (Transformers 自动切分)
-   • gradient_checkpointing=True 降显存
-   • 默认 rank 64 / alpha 128 / rsLoRA 可开关
+功能:
+1. 载入 Qwen3‑32B‑Chat 本地权重 (BF16 + device_map=auto)
+2. 注入 LoRA (可切换 rsLoRA)
+3. 使用 TRL 的 SFTTrainer 做指令微调 (Alpaca 格式)
 """
+
 import os
 os.environ["TRANSFORMERS_NO_TP"] = "1"
-import argparse, json, logging, sys, math, torch
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    TrainingArguments,
-)
-from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer
+os.environ["ACCELERATE_DISABLE_DISTRIBUTED"] = "1"
+for v in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+    os.environ.pop(v, None)
+import argparse
+import logging
+import sys
+import json
+from typing import Dict
 
-# ────────────────────────────────────────────────────────────────────────────────
-# argparse – base defaults
-# ────────────────────────────────────────────────────────────────────────────────
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer, SFTConfig
+
+import torch.nn.functional as F
+
+class MPFriendlySFTTrainer(SFTTrainer):
+    """SFTTrainer that moves `labels` to the logits device (last layer GPU)."""
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # 把 labels 挪到与 logits 相同的 GPU
+        labels = labels.to(logits.device, non_blocking=True)
+
+        # from transformers.loss.loss_utils import fixed_cross_entropy
+        # —— GPT-style 右移一位 —— 
+        shift_logits = logits[..., :-1, :].contiguous()   # (B, T-1, V)
+        shift_labels = labels[..., 1:].contiguous()       # (B, T-1)
+
+        # —— 展平后计算 CE —— 
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),   # (B·(T-1), V)
+            shift_labels.view(-1),                          # (B·(T-1))
+            ignore_index=-100,
+        )
+
+        # print("shift_logits.requires_grad =", shift_logits.requires_grad)
+
+        return (loss, outputs) if return_outputs else loss
+
+# ────────────────────── CLI ──────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    # data & model
-    p.add_argument("--model_dir", type=str, default="/opt/ml/input/model",
-                   help="本地 Qwen‑32B 权重目录; 若不存在则尝试 HF Hub")
-    p.add_argument("--base_model", type=str,
-                   default="Qwen/Qwen-32B-Chat",
-                   help="HF Hub id; 离线时忽略")
-    p.add_argument("--train_file", type=str, required=True)
-    p.add_argument("--dev_file",   type=str, required=True)
-    p.add_argument("--output_dir", type=str,
-                   default=os.getenv("SM_MODEL_DIR", "./lora_out"))
+    # 路径
+    p.add_argument("--model_dir",   type=str, required=True)
+    p.add_argument("--train_file",  type=str, required=True)
+    p.add_argument("--dev_file",    type=str, required=True)
+    p.add_argument("--output_dir",  type=str, required=True)
     # LoRA
-    p.add_argument("--lora_r",        type=int,   default=64)
-    p.add_argument("--lora_alpha",    type=int,   default=128)
-    p.add_argument("--lora_dropout",  type=float, default=0.05)
-    p.add_argument("--bias",          type=str,   default="none",
-                   choices=["none", "lora_only", "all"])
-    p.add_argument("--use_rslora",    type=lambda x: str(x).lower()=="true",
-                   default=False)
-    # training
-    p.add_argument("--batch_size",    type=int,   default=1,
-                   help="per‑device batch size")
-    p.add_argument("--grad_acc",      type=int,   default=32,
-                   help="gradient accumulation steps")
-    p.add_argument("--num_epochs",    type=int,   default=3)
-    p.add_argument("--lr",            type=float, default=2e-4)
-    p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--deepspeed",     type=str,   default="", help="json config")
+    p.add_argument("--lora_r",       type=int,   default=64)
+    p.add_argument("--lora_alpha",   type=int,   default=128)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--use_rslora",   type=lambda x: str(x).lower() == "true", default=False)
+    # 训练
+    p.add_argument("--per_device_batch_size", type=int,   default=1)
+    p.add_argument("--grad_acc",              type=int,   default=32)
+    p.add_argument("--num_epochs",            type=int,   default=3)
+    p.add_argument("--learning_rate",         type=float, default=2e-4)
+    p.add_argument("--seed",                  type=int,   default=42)
     return p.parse_args()
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# override with hyperparameters.json if exists
-# ────────────────────────────────────────────────────────────────────────────────
-def merge_hyperparameters(args: argparse.Namespace) -> None:
-    hp_json = "/opt/ml/input/config/hyperparameters.json"
-    if not os.path.exists(hp_json):
-        return
-    with open(hp_json) as f:
-        raw = json.load(f)
-    for k, v in raw.items():
-        if not hasattr(args, k):
-            continue
-        cur = getattr(args, k)
-        if isinstance(cur, bool):
-            casted = str(v).lower() == "true"
-        else:
-            casted = type(cur)(v)
-        setattr(args, k, casted)
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# data format helper
-# ────────────────────────────────────────────────────────────────────────────────
-def alpaca_to_text(ex):
+# ────────────────────── 数据映射 ──────────────────────
+def alpaca_to_text(ex: Dict) -> Dict:
     return {
-        "text":
-        f"{ex['instruction']}\n### 输入:\n{ex['input']}\n### 输出:\n{ex['output']}"
+        "text": f"{ex['instruction']}\n### 输入:\n{ex['input']}\n### 输出:\n{ex['output']}"
     }
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# main
-# ────────────────────────────────────────────────────────────────────────────────
+# ────────────────────── 主流程 ──────────────────────
 def main() -> None:
     args = parse_args()
-    merge_hyperparameters(args)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # logging
+    # Logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[
-            logging.FileHandler(os.path.join(args.output_dir, "train.log")),
             logging.StreamHandler(sys.stdout),
+            logging.FileHandler(os.path.join(args.output_dir, "train.log")),
         ],
     )
     logging.info("Effective args:\n%s", json.dumps(vars(args), indent=2))
 
-    # 1) select path
-    model_src = args.model_dir if os.path.exists(os.path.join(args.model_dir, "config.json")) else args.base_model
-    logging.info("Loading model from: %s", model_src)
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_dir, trust_remote_code=True, local_files_only=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # 2) tokenizer
-    try:
-        # 先尝试 fast（若未来镜像升级，可自动生效）
-        tok = AutoTokenizer.from_pretrained(
-            model_src,
-            trust_remote_code=True,
-            local_files_only=True
-        )
-    except Exception as e:
-        logging.warning("Fast tokenizer failed (%s). Fallback to slow tokenizer.", e)
-        tok = AutoTokenizer.from_pretrained(
-            model_src,
-            trust_remote_code=True,
-            local_files_only=True,
-            use_fast=False        # ← 强制 slow 版本
-        )
-
-    # 3) base model – BF16 + auto sharding
+    # Base model
     model = AutoModelForCausalLM.from_pretrained(
-        model_src,
+        args.model_dir,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
-    logging.info("Base model loaded")
 
-    # 4) LoRA config
+    # LoRA
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        bias=args.bias,
         task_type="CAUSAL_LM",
         use_rslora=args.use_rslora,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj"
+            "gate_proj", "up_proj", "down_proj",
         ],
     )
     model = get_peft_model(model, lora_cfg)
-    logging.info("LoRA wrapped (rsLoRA=%s)", args.use_rslora)
+    model.print_trainable_parameters()
 
-    # datasets
-    ds_train = load_dataset("json", data_files=args.train_file,
-                            split="train").map(alpaca_to_text)
-    ds_dev   = load_dataset("json", data_files=args.dev_file,
-                            split="train").map(alpaca_to_text)
+    # Dataset
+    train_ds = load_dataset("json", data_files=args.train_file, split="train").map(alpaca_to_text)
+    dev_ds   = load_dataset("json", data_files=args.dev_file,   split="train").map(alpaca_to_text)
 
-    # training arguments
-    train_args = TrainingArguments(
+    # Trainer config (SFTConfig 仍然适用)
+    sft_cfg = SFTConfig(
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
+        per_device_train_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.grad_acc,
         num_train_epochs=args.num_epochs,
-        learning_rate=args.lr,
+        learning_rate=args.learning_rate,
         lr_scheduler_type="cosine",
-        evaluation_strategy="epoch",
-        save_strategy="no",                  # 只在结束时手动保存
         logging_steps=50,
-        gradient_checkpointing=True,
+        save_strategy="no",
+        eval_strategy="epoch",
         bf16=True,
+        # fp16=False,  # 显式禁用混合精度
         seed=args.seed,
-        report_to="none",
-        deepspeed=args.deepspeed if args.deepspeed else None,
+        dataset_text_field="text",
+        optim="adamw_torch",
+        gradient_checkpointing=False,
     )
 
-    trainer = SFTTrainer(
+    # SFTTrainer (trl 0.18.x)
+    # trainer = SFTTrainer(
+    #     model=model,
+    #     args=sft_cfg,
+    #     train_dataset=train_ds,
+    #     eval_dataset=dev_ds,
+    #     processing_class=tokenizer,
+    # )
+    trainer = MPFriendlySFTTrainer(
         model=model,
-        tokenizer=tok,
-        args=train_args,
-        train_dataset=ds_train,
-        eval_dataset=ds_dev,
-        dataset_text_field="text",
+        args=sft_cfg,
+        train_dataset=train_ds,
+        eval_dataset=dev_ds,
+        processing_class=tokenizer,
     )
 
     trainer.train()
 
-    # 手动保存一次 – PEFT adapter + tokenizer
+    # Save adapter & tokenizer
     model.save_pretrained(args.output_dir)
-    tok.save_pretrained(args.output_dir)
-    logging.info("Finished – adapter saved to %s", args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    logging.info("✅ Training finished — LoRA adapter saved to %s", args.output_dir)
 
 
 if __name__ == "__main__":
