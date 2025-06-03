@@ -16,6 +16,8 @@ os.environ["TRANSFORMERS_NO_TP"] = "1"
 
 # ─────────────────────────── Imports ────────────────────────────────────────
 import json, argparse, tqdm, sacrebleu
+import torch
+import re
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ───────────────────── CLI arguments ────────────────────────────────────────
@@ -33,7 +35,26 @@ print("🔄 Loading tokenizer & base model …")
 tokenizer = AutoTokenizer.from_pretrained(
     args.base_dir, trust_remote_code=True, local_files_only=True
 )
-model     = AutoModelForCausalLM.from_pretrained(
+tokenizer.use_default_system_prompt = False   # 关闭默认模板，手动构造
+
+def build_prompt(src_zh: str) -> str:
+    """使用官方 chat_template 生成 prompt"""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一个游戏《黑神话：悟空》的翻译专家。请将给定的中文文本翻译成英文。"
+                "对于尖括号<>或大括号{{}}包围的占位符，请保持英文部分不变，仅翻译其中的中文部分。"
+                "❗只输出英文译文，严禁输出任何解释、标注、<think> 思考、代码或多余文本。"
+            ),
+        },
+        {"role": "user", "content": src_zh},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )  # 结尾自动带 <|im_start|>assistant\n
+
+model = AutoModelForCausalLM.from_pretrained(
     args.base_dir,
     torch_dtype="auto",
     device_map="auto",
@@ -49,18 +70,26 @@ with open(args.test_file, encoding="utf-8") as fin, \
 
     for line in tqdm.tqdm(fin, desc="✓ generating (base)"):
         ex = json.loads(line)
-        prompt = f"{ex['instruction']}\n### 输入:\n{ex['input']}\n### 输出:\n"
-        in_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
+        prompt = build_prompt(ex["input"])
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
         print(f"Current Source Text: {ex['input']}")
 
-        with model.no_sync():              # no grad
+        with torch.no_grad():
             out_ids = model.generate(
-                in_ids,
-                max_new_tokens=1024,       # keep same as eval_lora
-                temperature=0.7,
-                top_p=0.9,
+                input_ids,
+                max_new_tokens=1024,
+                temperature=0.2,      # 更确定
+                top_p=0.95,
+                repetition_penalty=1.05,
+                eos_token_id=tokenizer.convert_tokens_to_ids("<|im_end|>"),
+                pad_token_id=tokenizer.eos_token_id,
             )
-        pred = tokenizer.decode(out_ids[0][in_ids.shape[1]:], skip_special_tokens=True)
+
+        raw = tokenizer.decode(out_ids[0][input_ids.size(1):], skip_special_tokens=False)
+        # print("RAW >>>", repr(raw))        # 调试
+
+        raw  = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
+        pred = raw.split("<|im_end|>")[0].strip()
         print(f"Current Translation: {pred}")
 
         refs.append(ex["output"].strip())
